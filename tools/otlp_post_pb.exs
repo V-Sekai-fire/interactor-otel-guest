@@ -30,9 +30,10 @@ defmodule OtlpPostPb do
   def main(_), do: fail("usage: otlp_post_pb.exs <records.pb> [--dry]")
 
   def request(attrs, records) do
-    resource = Enum.map_join(attrs, fn {k, v} -> field(1, key_value(k, v)) end)
+    # Resource: attributes 1, dropped_attributes_count 2; ResourceSpans: resource 1, scope_spans 2, schema_url 3.
+    resource = Enum.map_join(attrs, fn {k, v} -> field(1, key_value(k, v)) end) <> <<0x10, 0>>
     scopes = Enum.map_join(records, fn r -> field(2, r) end)
-    field(1, field(1, resource) <> scopes)
+    field(1, field(1, resource) <> scopes <> field(3, "https://opentelemetry.io/schemas/1.27.0"))
   end
 
   def records(<<>>, acc), do: Enum.reverse(acc)
