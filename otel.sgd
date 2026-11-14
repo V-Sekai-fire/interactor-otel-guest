@@ -1,0 +1,229 @@
+var service: String = ""
+var scope: String = ""
+var rng: int = 1
+var open: Dictionary = {}
+var done: Array = []
+var serial: int = 0
+var trace: String = ""
+var meters: Dictionary = {}
+var lines: Array = []
+var bounds: Array = [1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0]
+
+
+func reset(service_name: String, scope_name: String, seed: int) -> bool:
+	service = service_name
+	scope = scope_name
+	rng = seed if seed != 0 else 88172645463325252
+	open = {}
+	done = []
+	serial = 0
+	meters = {}
+	lines = []
+	trace = _hex(32)
+	return true
+
+
+func new_trace() -> String:
+	trace = _hex(32)
+	return trace
+
+
+func start_span(name: String, parent: String, kind: int, now_ns: String) -> String:
+	var id: String = _hex(16)
+	var span: Dictionary = {"traceId": trace, "spanId": id, "name": name, "kind": kind, "startTimeUnixNano": now_ns, "attributes": []}
+	if parent != "":
+		span["parentSpanId"] = parent
+	open[id] = span
+	return id
+
+
+func set_attr_s(id: String, key: String, value: String) -> bool:
+	return _attr(id, key, {"stringValue": value})
+
+
+func set_attr_i(id: String, key: String, value: int) -> bool:
+	return _attr(id, key, {"intValue": str(value)})
+
+
+func set_attr_f(id: String, key: String, value: float) -> bool:
+	return _attr(id, key, {"doubleValue": value})
+
+
+func set_attr_b(id: String, key: String, value: bool) -> bool:
+	return _attr(id, key, {"boolValue": value})
+
+
+func add_event(id: String, name: String, now_ns: String) -> bool:
+	if not open.has(id):
+		return false
+	var span: Dictionary = open[id]
+	if not span.has("events"):
+		span["events"] = []
+	span["events"].append({"name": name, "timeUnixNano": now_ns})
+	return true
+
+
+func set_status(id: String, code: int, message: String) -> bool:
+	if not open.has(id):
+		return false
+	var status: Dictionary = {"code": code}
+	if message != "":
+		status["message"] = message
+	open[id]["status"] = status
+	return true
+
+
+func end_span(id: String, now_ns: String) -> bool:
+	if not open.has(id):
+		return false
+	var span: Dictionary = open[id]
+	span["endTimeUnixNano"] = now_ns
+	open.erase(id)
+	done.append(span)
+	return true
+
+
+func pending() -> int:
+	return done.size()
+
+
+func drain() -> String:
+	if done.size() == 0:
+		return ""
+	var body: Dictionary = {"resourceSpans": [{"resource": _resource(), "scopeSpans": [{"scope": {"name": scope}, "spans": done}]}]}
+	var text: String = JSON.stringify(body)
+	done = []
+	return text
+
+
+func counter_add(name: String, unit: String, value: float, now_ns: String) -> bool:
+	var m: Dictionary = _meter(name, "sum", unit, now_ns)
+	m["value"] = m["value"] + value
+	m["time"] = now_ns
+	return true
+
+
+func gauge_set(name: String, unit: String, value: float, now_ns: String) -> bool:
+	var m: Dictionary = _meter(name, "gauge", unit, now_ns)
+	m["value"] = value
+	m["time"] = now_ns
+	return true
+
+
+func histogram_record(name: String, unit: String, value: float, now_ns: String) -> bool:
+	var m: Dictionary = _meter(name, "histogram", unit, now_ns)
+	var at: int = bounds.size()
+	for i in bounds.size():
+		if value <= bounds[i]:
+			at = i
+			break
+	m["buckets"][at] += 1
+	m["count"] += 1
+	m["value"] = m["value"] + value
+	m["time"] = now_ns
+	return true
+
+
+func drain_metrics() -> String:
+	if meters.size() == 0:
+		return ""
+	var list: Array = []
+	for name in meters:
+		var m: Dictionary = meters[name]
+		var point: Dictionary = {"startTimeUnixNano": m["start"], "timeUnixNano": m["time"]}
+		var entry: Dictionary = {"name": name}
+		if m["unit"] != "":
+			entry["unit"] = m["unit"]
+		if m["kind"] == "gauge":
+			point["asDouble"] = m["value"]
+			entry["gauge"] = {"dataPoints": [point]}
+		elif m["kind"] == "sum":
+			point["asDouble"] = m["value"]
+			entry["sum"] = {"dataPoints": [point], "aggregationTemporality": 1, "isMonotonic": true}
+		else:
+			point["count"] = str(m["count"])
+			point["sum"] = m["value"]
+			var counts: Array = []
+			for c in m["buckets"]:
+				counts.append(str(c))
+			point["bucketCounts"] = counts
+			point["explicitBounds"] = bounds
+			entry["histogram"] = {"dataPoints": [point], "aggregationTemporality": 1}
+		list.append(entry)
+	meters = {}
+	return JSON.stringify({"resourceMetrics": [{"resource": _resource(), "scopeMetrics": [{"scope": {"name": scope}, "metrics": list}]}]})
+
+
+func log(level: String, body: String, span_id: String, now_ns: String) -> bool:
+	var record: Dictionary = {"timeUnixNano": now_ns, "observedTimeUnixNano": now_ns, "severityNumber": _severity(level), "severityText": level, "body": {"stringValue": body}}
+	if span_id != "":
+		record["traceId"] = trace
+		record["spanId"] = span_id
+	lines.append(record)
+	return true
+
+
+func pending_logs() -> int:
+	return lines.size()
+
+
+func drain_logs() -> String:
+	if lines.size() == 0:
+		return ""
+	var text: String = JSON.stringify({"resourceLogs": [{"resource": _resource(), "scopeLogs": [{"scope": {"name": scope}, "logRecords": lines}]}]})
+	lines = []
+	return text
+
+
+func _severity(level: String) -> int:
+	match level:
+		"TRACE":
+			return 1
+		"DEBUG":
+			return 5
+		"INFO":
+			return 9
+		"WARN":
+			return 13
+		"ERROR":
+			return 17
+		"FATAL":
+			return 21
+	return 0
+
+
+func _resource() -> Dictionary:
+	return {"attributes": [{"key": "service.name", "value": {"stringValue": service}}]}
+
+
+func _meter(name: String, kind: String, unit: String, now_ns: String) -> Dictionary:
+	if not meters.has(name):
+		var buckets: Array = []
+		buckets.resize(bounds.size() + 1)
+		buckets.fill(0)
+		meters[name] = {"kind": kind, "unit": unit, "start": now_ns, "time": now_ns, "value": 0.0, "count": 0, "buckets": buckets}
+	return meters[name]
+
+
+func _attr(id: String, key: String, value: Dictionary) -> bool:
+	if not open.has(id):
+		return false
+	open[id]["attributes"].append({"key": key, "value": value})
+	return true
+
+
+func _next() -> int:
+	rng = rng ^ (rng << 13)
+	rng = rng ^ ((rng >> 7) & 0x01FFFFFFFFFFFFFF)
+	rng = rng ^ (rng << 17)
+	return rng
+
+
+func _hex(nibbles: int) -> String:
+	var out: String = ""
+	var word: int = 0
+	for i in nibbles:
+		if i % 16 == 0:
+			word = _next()
+		out += "0123456789abcdef"[(word >> (4 * (i % 16))) & 15]
+	return out
